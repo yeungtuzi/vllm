@@ -4,6 +4,9 @@
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _f32_to_e4m3_uint8,
+)
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -330,8 +333,11 @@ def _rope_quant_insert_kernel(
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
     exponent = tl.ceil(tl.log2(amax * (1.0 / 448.0)))
     scaled = quant * tl.reshape(tl.exp2(-exponent), (8, 1))
-    fp8 = tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv)
-    packed = tl.reshape(fp8.to(tl.uint8, bitcast=True), (512,))
+    # Ampere (SM80) has no fp8e4nv; encode e4m3 bytes directly (identical
+    # 1-byte layout -- this is the fp8_ds_mla uint8 paged path).
+    packed = tl.reshape(
+        _f32_to_e4m3_uint8(tl.clamp(scaled, -448.0, 448.0)), (512,)
+    )
     tl.store(values + d, packed, d < 448)
     s = tl.arange(0, 8)
     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0

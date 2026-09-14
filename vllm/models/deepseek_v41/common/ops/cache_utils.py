@@ -18,6 +18,10 @@ from typing import Any
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _e4m3_uint8_to_f32,
+    _f32_to_e4m3_uint8,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -34,6 +38,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import next_power_of_2
+from vllm.v1.attention.backends.mla.sparse_mla_env import is_ampere_or_ada
 
 # Per-token byte width of the two paged fp8 records. Both put a page's whole
 # data region ahead of its whole scale region, so ``k_cache.shape[-1]`` -- the
@@ -151,10 +156,10 @@ def quantize_and_insert_k_kernel(
 
             # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
             if use_fnuz:
-                x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_clamped.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
             else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                # Ampere (SM80) has no fp8e4nv type; encode e4m3 bytes directly.
+                x_uint8 = _f32_to_e4m3_uint8(x_clamped)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -404,12 +409,10 @@ def _dequantize_and_gather_k_kernel(
 
                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
                 if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(tl.float32)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    # Ampere (SM80) has no fp8e4nv type; decode e4m3 bytes.
+                    x_float = _e4m3_uint8_to_f32(x_uint8)
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -683,7 +686,11 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl() and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN:
+    if (
+        has_cutedsl()
+        and not is_ampere_or_ada()
+        and k_cache.shape[-1] != V41_NVFP4_BYTES_PER_TOKEN
+    ):
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,

@@ -15,6 +15,9 @@ group-boundary tokens ``(position + 1) % compress_ratio == 0`` produce a key.
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _f32_to_e4m3_uint8,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -243,7 +246,8 @@ def _indexer_k_norm_rope_quant_store_kernel(
         exponent = tl.ceil(tl.log2(absmax * INV_FP8_MAX))
         inv_scale = tl.exp2(-exponent)
         x_clamped = tl.clamp(result_bf16 * inv_scale, -FP8_MAX, FP8_MAX)
-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        # Ampere (SM80) has no fp8e4nv; encode e4m3 bytes directly.
+        x_uint8 = _f32_to_e4m3_uint8(x_clamped)
         if SHUFFLE:
             tiled = (
                 block // HEAD_TILE_SIZE * BLOCK_TILE_SIZE * HEAD_TILE_SIZE
