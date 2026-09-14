@@ -760,7 +760,13 @@ def mhc_pre_broadcast_tilelang(
         fn_broadcast,
         hidden_size=hidden_size,
         hc_mult=hc_mult,
-        use_tilelang_fallback=False,
+        # Let the helper decide: `use_deep_gemm = is_deep_gemm_supported() or not
+        # use_tilelang_fallback`. Hard-coding False forced `tf32_hc_prenorm_gemm`
+        # even on architectures DeepGEMM does not support (A100/SM80), where it
+        # aborts with "Unsupported architecture" in hyperconnection.hpp. Every
+        # other mHC pre path already gates on DeepGEMM support; this was the one
+        # parity gap.
+        use_tilelang_fallback=True,
     )
     _MHC_PRE_BIG_FUSE_TILELANG_KERNEL(
         gemm_out_mul,

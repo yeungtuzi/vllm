@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import typing
+import os
+import time
 from collections.abc import Callable, Iterable
 from inspect import signature
 from itertools import islice
@@ -1188,6 +1190,9 @@ def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     )
 
 
+_T_LAYER: dict[str, float] = {"t": 0.0, "n": 0}
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1200,6 +1205,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.prefix = prefix
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -1327,10 +1333,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
         mega_gate_metadata: MegaGateRoutingMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        _timing = os.environ.get("XIAOTU_TIMING") == "1"
+        _t0 = time.perf_counter() if _timing else 0.0
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
             # Run standalone mhc_pre on first layer
+            if os.environ.get("XIAOTU_DEBUG_L2") == "1" and extract_layer_index(self.prefix) < 3:
+                _br = self.hc_attn_fn_broadcast
+                _fn = self.hc_attn_fn
+                print(f"[L2] {self.prefix} hcB broadcast_nz={( _br!=0).float().mean().item():.3e} "
+                      f"broadcast_absmean={_br.abs().mean().item():.3e} "
+                      f"fn_absmean={_fn.abs().mean().item():.3e} qlen={x.size(0)}", flush=True)
             if x.dim() == 2:
                 assert self.hc_attn_fn_broadcast is not None
                 residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(
@@ -1385,9 +1399,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        _l3 = os.environ.get("XIAOTU_DEBUG_L3") == "1" and extract_layer_index(self.prefix) < 3
+        if _l3:
+            print(
+                f"[L3] {self.prefix} pre_attn={x.abs().mean().item():.3e} "
+                f"res={residual.abs().mean().item():.3e} "
+                f"pm={post_mix.abs().mean().item():.3e} "
+                f"rm={res_mix.abs().mean().item():.3e}",
+                flush=True,
+            )
+        if os.environ.get("XIAOTU_DEBUG_L2") == "1" and extract_layer_index(self.prefix) < 3:
+            _a = x.abs().mean().item()
         x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
+        if _l3:
+            print(f"[L3] {self.prefix} attn_out={x.abs().mean().item():.3e}", flush=True)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
@@ -1411,6 +1438,25 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         x = self.ffn(x, input_ids, mega_gate_metadata)
+        if _l3:
+            print(
+                f"[L3] {self.prefix} ffn_out={x.abs().mean().item():.3e} "
+                f"res_after={residual.abs().mean().item():.3e}",
+                flush=True,
+            )
+        if os.environ.get("XIAOTU_DEBUG_L2") == "1" and extract_layer_index(self.prefix) < 3:
+            _b = x.abs().mean().item()
+            print(f"[L2] {self.prefix} attn_in={_a:.3e} ffn_in={_b:.3e} qlen={x.size(0)}",
+                  flush=True)
+        if _timing:
+            _T_LAYER["t"] += time.perf_counter() - _t0
+            _T_LAYER["n"] += 1
+            if _T_LAYER["n"] % 43 == 0:
+                print(
+                    f"[xiaotu-timing] layer_43x={_T_LAYER['t']:.3f}s ntok={x.size(0)}",
+                    flush=True,
+                )
+                _T_LAYER["t"] = 0.0
         return x, residual, post_mix, res_mix
 
 
@@ -1568,6 +1614,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = input_ids.to(torch.int64)
 
         full_num_tokens = positions.shape[0]
+        if os.environ.get("XIAOTU_DEBUG_L3") == "1":
+            print(
+                f"[L3] embed={hidden_states.abs().mean().item():.3e} "
+                f"nz={(hidden_states != 0).float().mean().item():.3e} "
+                f"ntok={hidden_states.shape[0]}",
+                flush=True,
+            )
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
@@ -1638,6 +1691,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
+        if os.environ.get("XIAOTU_DEBUG_L3") == "1":
+            print(
+                f"[L3] final_hidden={hidden_states.abs().mean().item():.3e} "
+                f"nz={(hidden_states != 0).float().mean().item():.3e}",
+                flush=True,
+            )
         hidden_states = hc_head_fused_kernel_tilelang(
             hidden_states,
             self.hc_head_fn,
@@ -1994,13 +2053,30 @@ class DeepseekV4ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if os.environ.get("XIAOTU_DEBUG_L3") == "1":
+            _l = logits.float()
+            _top = _l.topk(5, dim=-1)
+            print(
+                f"[L3] logits absmean={_l.abs().mean().item():.3e} "
+                f"nz={(_l != 0).float().mean().item():.3e} "
+                f"argmax={_top.indices[0].tolist()} topvals={[round(v, 4) for v in _top.values[0].tolist()]}",
+                flush=True,
+            )
         return logits
 
     def compute_logits_local(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        logits = self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+        if os.environ.get("XIAOTU_DEBUG_L3") == "1":
+            _l = logits.float()
+            print(
+                f"[L3] logits_local absmean={_l.abs().mean().item():.3e} "
+                f"argmax={_l.topk(3, dim=-1).indices[0].tolist()}",
+                flush=True,
+            )
+        return logits
 
     def forward(
         self,

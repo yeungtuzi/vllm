@@ -11,6 +11,7 @@ from compressed_tensors.quantization import (
 )
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
@@ -117,6 +118,10 @@ def backend_to_kernel_cls(
 def _get_priority_backends() -> list[WNA16MoEBackend]:
     """Get available backends in priority order based on platform and config."""
     if current_platform.is_cpu():
+        return [WNA16MoEBackend.CPU]
+    # GPU/CPU mixed mode: expert weights live on the host (see
+    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
+    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
         return [WNA16MoEBackend.CPU]
     if current_platform.is_xpu():
         return [WNA16MoEBackend.XPU]
@@ -981,6 +986,27 @@ def _process_weights_cpu(
             w2_qzeros.data.view(torch.int32)
             if w2_qzeros.dtype != torch.int32
             else w2_qzeros.data
+        )
+
+    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
+        # GPU/CPU mixed mode: the CPU backend is an out-of-tree engine that
+        # consumes the raw packed int4 weights + scales directly, so skip the
+        # AMX blocked repack.
+        return (
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+            w13_g_idx,
+            w2_g_idx,
+            None,  # w13_g_idx_sort_indices
+            None,  # w2_g_idx_sort_indices
+            w13_zeros,
+            w2_zeros,
+            None,  # w13_input_global_scale
+            None,  # w2_input_global_scale
+            w13_bias,
+            w2_bias,
         )
 
     (

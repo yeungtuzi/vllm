@@ -103,7 +103,11 @@ from vllm.version import __version__ as VLLM_VERSION
 logger = init_logger(__name__)
 
 
-HANDSHAKE_TIMEOUT_MINS = 5
+# EngineCore <-> front-end handshake budget.  A CPU/GPU hybrid MoE deployment
+# (routed-expert weights in host memory) builds one CPU MoE engine per layer
+# during weight loading, which can exceed 5 minutes for a 40+ layer model; the
+# timeout is therefore overridable.  Defaults to the upstream 5 minutes.
+HANDSHAKE_TIMEOUT_MINS = int(os.environ.get("VLLM_HANDSHAKE_TIMEOUT_MINS", "5"))
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 

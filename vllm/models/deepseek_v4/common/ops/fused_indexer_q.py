@@ -6,6 +6,9 @@ from typing import Any
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _f32_to_e4m3_uint8,
+)
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -15,6 +18,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+from vllm.v1.attention.backends.mla.sparse_mla_env import is_ampere_or_ada
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -164,8 +168,9 @@ class FusedIndexerQRopeQuantTritonKernel(
         index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
 
         # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
-        # (e4m3fn) elsewhere -- matches the K cache.
-        fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
+        # (e4m3fn) elsewhere -- matches the K cache. On Ampere (SM80/SM86) Triton
+        # lacks fp8e4nv, so encode the raw e4m3fn uint8 bits ourselves; the launch
+        # therefore passes index_q_fp8.view(torch.uint8).
         fp8_base_ptr = (
             index_q_fp8_ptr
             + tok_idx * index_q_fp8_stride0
@@ -174,16 +179,16 @@ class FusedIndexerQRopeQuantTritonKernel(
         if INDEX_Q_NOPE_DIM > 0:
             tl.store(
                 fp8_base_ptr + nope_offset,
-                tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
+                _f32_to_e4m3_uint8(tl.div_rn(x_nope, index_q_scale)),
             )
         fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
         tl.store(
             fp8_rot_base + half_offset * 2,
-            tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
+            _f32_to_e4m3_uint8(tl.div_rn(r_even, index_q_scale)),
         )
         tl.store(
             fp8_rot_base + half_offset * 2 + 1,
-            tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
+            _f32_to_e4m3_uint8(tl.div_rn(r_odd, index_q_scale)),
         )
 
         # FP8 weight-fold contract:
@@ -261,7 +266,7 @@ class FusedIndexerQRopeQuantTritonKernel(
             index_weights_softmax_scale=1.0,
             index_weights_head_scale=1.0,
             index_q_fp8=TritonWarmupTensor(
-                current_platform.fp8_dtype(),
+                torch.uint8,
                 shape=(1, compile_key.num_heads, compile_key.index_q_head_dim),
                 strides=(q_stride0, compile_key.index_q_head_dim, 1),
             ),
@@ -613,7 +618,7 @@ def fused_indexer_q_rope_quant(
             dtype=torch.uint8,
             device=index_q.device,
         )
-        if has_cutedsl():
+        if has_cutedsl() and not is_ampere_or_ada():
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 _INDEXER_Q_MXFP4_KERNEL,
@@ -671,7 +676,7 @@ def fused_indexer_q_rope_quant(
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = 224.0 if use_fnuz else 448.0
     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
-    if has_cutedsl():
+    if has_cutedsl() and not is_ampere_or_ada():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             _INDEXER_Q_FP8_KERNEL,
@@ -719,7 +724,7 @@ def fused_indexer_q_rope_quant(
             index_weights,
             index_weights_softmax_scale,
             index_weights_head_scale,
-            index_q_fp8,
+            index_q_fp8.view(torch.uint8),
             index_weights_out,
             fp8_max=fp8_max,
             use_fnuz=use_fnuz,

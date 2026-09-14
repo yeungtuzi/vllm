@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepseekV4 MLA Attention Layer."""
 
+import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -125,6 +127,9 @@ def _resolve_dsv4_kv_cache_dtype(
         return kv_cache_dtype, torch.float8_e4m3fn
     # auto / bfloat16 -> plain bf16 KV row.
     return kv_cache_dtype, torch.bfloat16
+
+
+_T_ATTN: dict[str, float] = {"t": 0.0, "n": 0}
 
 
 class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
@@ -467,6 +472,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        _timing = os.environ.get("XIAOTU_TIMING") == "1"
+        _t0 = time.perf_counter() if _timing else 0.0
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
         num_tokens = hidden_states.shape[0]
@@ -496,8 +503,37 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
+        if os.environ.get("XIAOTU_DEBUG_L4") == "1" and extract_layer_index(
+            self.prefix
+        ) < 3:
+            print(
+                f"[L4] {self.prefix} o_padded={o_padded.abs().mean().item():.3e} "
+                f"nz={(o_padded != 0).float().mean().item():.3e} "
+                f"o={o.abs().mean().item():.3e} ntok={num_tokens}",
+                flush=True,
+            )
+
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        return self._o_proj(o, positions)
+        out = self._o_proj(o, positions)
+        if os.environ.get("XIAOTU_DEBUG_L4") == "1" and extract_layer_index(
+            self.prefix
+        ) < 3:
+            print(
+                f"[L4] {self.prefix} o_proj_out={out.abs().mean().item():.3e} "
+                f"nz={(out != 0).float().mean().item():.3e}",
+                flush=True,
+            )
+        if _timing:
+            _T_ATTN["t"] += time.perf_counter() - _t0
+            _T_ATTN["n"] += 1
+            if _T_ATTN["n"] % 43 == 0:
+                print(
+                    f"[xiaotu-timing] attn_43layers={_T_ATTN['t']:.3f}s "
+                    f"ntok={num_tokens}",
+                    flush=True,
+                )
+                _T_ATTN["t"] = 0.0
+        return out
 
     def _split_qkv_and_norm(
         self, qr_kv: torch.Tensor

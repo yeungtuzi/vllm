@@ -59,6 +59,17 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
     ) -> None:
         backends.append(backends.pop(backends.index(backend)))
 
+    def _move_to_front(
+        backends: list[UnquantizedMoeBackend],
+        backend: UnquantizedMoeBackend,
+    ) -> None:
+        # The CUDA/ROCm priority lists do not contain CPU, so insert instead of
+        # assuming membership (mixed mode needs CPU first on a GPU platform).
+        if backend in backends:
+            backends.insert(0, backends.pop(backends.index(backend)))
+        else:
+            backends.insert(0, backend)
+
     if current_platform.is_rocm():
         _AVAILABLE_BACKENDS = [
             UnquantizedMoeBackend.AITER,
@@ -103,6 +114,12 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
         ]
     elif current_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
+
+    # GPU/CPU mixed mode: expert weights live on the host (see
+    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
+    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
+        _move_to_front(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.CPU)
+
     return _AVAILABLE_BACKENDS
 
 

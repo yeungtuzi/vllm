@@ -11,6 +11,9 @@ from typing import Any
 
 import torch
 
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _f32_to_e4m3_uint8,
+)
 from vllm.model_executor.warmup.jit_warmup import kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
@@ -159,7 +162,9 @@ class FusedInvRopeFP8QuantKernel(
             ),
             (HEAD_DIM,),
         )
-        x_quant = tl.clamp(x / scales_exp, -fp8_max, fp8_max).to(tl.float8e4nv)
+        # Ampere (SM80/SM86) lacks the Triton fp8e4nv type; encode e4m3 bytes and
+        # store through a uint8 view of the output (identical 1-byte layout).
+        x_quant = _f32_to_e4m3_uint8(tl.clamp(x / scales_exp, -fp8_max, fp8_max))
 
         out_base = (
             out_ptr
@@ -283,7 +288,9 @@ class FusedInvRopeFP8QuantKernel(
                 shape=(1, compile_key.half_rope * 2),
             ),
             out_buf=TritonWarmupTensor(
-                torch.float8_e4m3fn if compile_key.quantize else torch.bfloat16,
+                # Kernel writes e4m3 bytes through a uint8 view (SM80-safe), so
+                # the warmup pointer must specialize as uint8 too.
+                torch.uint8 if compile_key.quantize else torch.bfloat16,
                 shape=(compile_key.heads_per_group, 1, out_dim),
                 strides=(out_dim, out_dim, 1),
             ),
@@ -474,7 +481,7 @@ def _fused_inv_rope_fp8_quant_kernel_impl(
         o,
         positions,
         cos_sin_cache,
-        out_buf,
+        out_buf.view(torch.uint8) if quantize else out_buf,
         scale_buf,
         num_tokens,
         heads_per_group=heads_per_group,

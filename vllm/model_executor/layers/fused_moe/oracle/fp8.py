@@ -137,6 +137,12 @@ def _get_priority_backends(
         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU_W8A8)
 
+    # GPU/CPU mixed mode: expert weights live on the host (see
+    # VLLM_EXPERTS_LOAD_DEVICE), so only the CPU backend can consume them.
+    # Prefer it on a GPU platform as well.
+    if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
+        _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
+
     return _AVAILABLE_BACKENDS
 
 
@@ -663,7 +669,14 @@ def convert_to_fp8_moe_kernel_format(
             prepare_fp8_moe_layer_for_cpu,
         )
 
-        w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
+        if envs.VLLM_EXPERTS_LOAD_DEVICE == "cpu":
+            # GPU/CPU mixed mode: the CPU backend is an out-of-tree engine that
+            # consumes the raw [E, 2I, H] fp8 weights + block scales directly,
+            # so skip the AMX prepack (which also needs torch.ops._C packing
+            # kernels that may not be built for every deployment).
+            pass
+        else:
+            w13, w2 = prepare_fp8_moe_layer_for_cpu(w13, w2)
     elif fp8_backend == Fp8MoeBackend.CPU_W8A8:
         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
             prepare_fp8_w8a8_moe_layer_for_cpu,
