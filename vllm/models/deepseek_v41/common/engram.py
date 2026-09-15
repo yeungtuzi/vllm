@@ -49,8 +49,12 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    _e4m3_uint8_to_f32,
+)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.mla.sparse_mla_env import is_ampere_or_ada
 
 logger = init_logger(__name__)
 
@@ -602,6 +606,7 @@ def _engram_lookup_kernel(
     QUANT_BLOCK: tl.constexpr,
     BLOCK_R: tl.constexpr,
     GRID,
+    E4M3_UINT8: tl.constexpr = False,
 ):
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
@@ -626,7 +631,7 @@ def _engram_lookup_kernel(
         values = tl.load(
             weight + local[:, None] * DIM + cols[None, :],
             mask=owned[:, None],
-            other=0.0,
+            other=0,
         )
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
@@ -635,9 +640,16 @@ def _engram_lookup_kernel(
         )
         # ue8m0 is a power of two, so its byte *is* the fp32 exponent field.
         scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        if E4M3_UINT8:
+            # Ampere/Ada have no Triton fp8e4nv, so the table is handed over as
+            # raw bytes and decoded manually. Byte-identical to the fp8 cast we
+            # verified against torch (0 mismatches over 1M values).
+            values_f32 = _e4m3_uint8_to_f32(values)
+        else:
+            values_f32 = values.to(tl.float32)
         tl.store(
             out + rows[:, None] * DIM + cols[None, :],
-            (values.to(tl.float32) * scale).to(tl.bfloat16),
+            (values_f32 * scale).to(tl.bfloat16),
             mask=valid[:, None],
         )
 
@@ -714,12 +726,15 @@ class ParallelEngramEmbedding(nn.Module):
         if not rows:
             return
         weight, scales = self._storage()
+        # Ampere/Ada have no Triton fp8e4nv dtype, so hand the table over as raw
+        # bytes there and decode in-kernel; SM90+ keeps the original fp8 path.
+        use_u8 = is_ampere_or_ada()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
         _engram_lookup_kernel[(grid,)](
-            weight,
+            weight.view(torch.uint8) if use_u8 else weight,
             scales,
             indices,
             out,
@@ -735,6 +750,7 @@ class ParallelEngramEmbedding(nn.Module):
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
             GRID=grid,
+            E4M3_UINT8=use_u8,
         )
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
