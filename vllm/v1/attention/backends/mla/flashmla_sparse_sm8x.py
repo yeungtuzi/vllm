@@ -38,6 +38,9 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     sparse_mla_fwd_with_sink,
 )
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_req_index_to_global_index,
+)
 
 if TYPE_CHECKING:
     pass
@@ -95,6 +98,34 @@ class FlashMLASparseSM8XImpl(FlashMLASparseImpl):
             q, kv_c_and_k_pe_cache, topk_indices, attn_metadata, q.shape[1]
         )
         return attn_out, None
+
+    def _convert_logical_to_physical_topk(
+        self,
+        logical_topk_indices: torch.Tensor,
+        attn_metadata: Any,
+        *,
+        block_stride_rows: int | None,
+        return_valid_counts: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # The inherited implementation routes the decode case through
+        # SparseMLAIndexGroup, whose side stream waits on ``logical_topk_ready``.
+        # That event is recorded on the *capturing* stream by the MLA wrapper's
+        # forward (mla.py record_logical_topk_ready), while this attention body
+        # runs eagerly inside a breakable CUDA graph -- so the cross-stream wait
+        # is invalid and CUDA raises cudaErrorInvalidValue on A100 during the
+        # profile/capture run. On SM8x the conversion is a tiny index kernel and
+        # decode batches are a handful of rows, so convert on the current stream
+        # instead of sharing one result across the layer group. This is the same
+        # kernel the prefill branch of _forward_bf16_kv already uses.
+        return triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[: logical_topk_indices.shape[0]],
+            attn_metadata.block_table,
+            logical_topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=logical_topk_indices.shape[1],
+            return_valid_counts=return_valid_counts,
+        )
 
     def _bf16_flash_mla_kernel(
         self,
