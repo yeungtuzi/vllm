@@ -521,6 +521,31 @@ class Glm5NextMLAAttention(nn.Module):
 
         self.is_v32 = config.index_topk is not None
 
+        attn_backend = None
+        if self.is_v32 and current_platform.is_cuda():
+            from vllm.utils.torch_utils import is_quantized_kv_cache
+            from vllm.v1.attention.backends.mla.flashmla_sparse_sm8x import (
+                FlashMLASparseSM8XBackend,
+                sm8x_sparse_mla_enabled,
+            )
+
+            # The SM8x Triton route only serves a bf16 KV cache. An explicit
+            # fp8/fp4 request must stay on the normal (empty-pool) path so it
+            # fails closed with the standard "no valid backend" error instead of
+            # building this bf16 impl against a packed cache.
+            kv_dtype = getattr(cache_config, "cache_dtype", "auto")
+            sm8x_kv_ok = kv_dtype is None or not is_quantized_kv_cache(kv_dtype)
+            if sm8x_sparse_mla_enabled() and sm8x_kv_ok:
+                # No sm8x sparse-MLA entry exists in the platform candidate pool
+                # (all generic sparse-MLA backends are SM90+; the dsv4 enum is a
+                # model-driven marker). Bind the SM8x Triton backend explicitly so
+                # the DSA layers build on Ampere/Ada; KV stays bf16.
+                attn_backend = FlashMLASparseSM8XBackend
+                logger.info_once(
+                    "GLM-5.3 DSA layers using the SM8x Triton sparse-MLA backend "
+                    "(capability floor 8.x); requires --kv-cache-dtype bfloat16."
+                )
+
         if self.is_v32:
             self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
                 qk_rope_head_dim,
@@ -564,6 +589,7 @@ class Glm5NextMLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            attn_backend=attn_backend,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(

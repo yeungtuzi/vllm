@@ -13,6 +13,7 @@ from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
+    from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.mla.index_group import (
         SparseMLAIndexGroupBuilder,
     )
@@ -37,6 +38,10 @@ class MLAModules:
     indexer_rotary_emb: torch.nn.Module | None = None
     g_proj: torch.nn.Module | None = None
     index_group_builder: "SparseMLAIndexGroupBuilder | None" = None
+    # Optional explicit MLA backend for this layer. When None (every existing
+    # caller) backend selection is unchanged; model code that knows the generic
+    # candidate pool cannot serve it can bind a backend directly.
+    attn_backend: "type[AttentionBackend] | None" = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -137,6 +142,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             topk_indices_buffer=mla_modules.topk_indices_buffer,
             index_group_builder=mla_modules.index_group_builder,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
+            attn_backend=mla_modules.attn_backend,
         )
         indexer_op = getattr(self.indexer, "indexer_op", None)
         if indexer_op is not None and hasattr(
